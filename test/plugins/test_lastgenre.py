@@ -1061,13 +1061,17 @@ class TestAliases:
         normalizing to 'hip hop') and the already-whitelisted 'Jazz' must
         survive, proving the count limit isn't applied early.
         """
-        config["lastgenre"]["force"] = True
-        config["lastgenre"]["keep_existing"] = True
-        config["lastgenre"]["source"] = "album"
-        config["lastgenre"]["whitelist"] = True
-        config["lastgenre"]["count"] = 1
-        config["lastgenre"]["aliases"] = {"hip hop": ["hip-hop", "hiphop"]}
-        plugin = lastgenre.LastGenrePlugin()
+        with self.configure_plugin(
+            {
+                "force": True,
+                "keep_existing": True,
+                "source": "album",
+                "whitelist": True,
+                "count": 1,
+                "aliases": {"hip hop": ["hip-hop", "hiphop"]},
+            }
+        ):
+            plugin = lastgenre.LastGenrePlugin()
         plugin.setup()
         plugin.whitelist = {"hip hop", "jazz"}
 
