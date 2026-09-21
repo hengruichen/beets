@@ -37,7 +37,7 @@ class ListenBrainzPlugin(BeetsPlugin):
         return [lbupdate_cmd]
 
     def _lbupdate(self, lib, log):
-        """Obtain view count from Listenbrainz."""
+        """Obtain view count from ListenBrainz."""
         found_total = 0
         unknown_total = 0
         ls = self.get_listens()
@@ -116,61 +116,25 @@ class ListenBrainzPlugin(BeetsPlugin):
                 mbid = self.get_mb_recording_id(track)
             tracks.append(
                 {
-                    "album": {
-                        "name": track["track_metadata"].get("release_name")
-                    },
-                    "name": track["track_metadata"].get("track_name"),
-                    "artist": {
-                        "name": track["track_metadata"].get("artist_name")
-                    },
-                    "mbid": mbid,
-                    "release_mbid": mbid_mapping.get("release_mbid"),
-                    "listened_at": track.get("listened_at"),
+                    "artist": track["track_metadata"]["artist_name"],
+                    "identifier": mbid,
+                    "title": track["track_metadata"]["track_name"],
                 }
             )
         return tracks
 
     def get_mb_recording_id(self, track):
-        """Returns the MusicBrainz recording ID for a track."""
+        """Returns the MBID of the recording."""
+        title = track["track_metadata"]["track_name"]
+        release = track["track_metadata"]["release_name"]
         resp = musicbrainzngs.search_recordings(
-            query=track["track_metadata"].get("track_name"),
-            release=track["track_metadata"].get("release_name"),
-            strict=True,
+            query=title, limit=1, release=release
         )
-        if resp.get("recording-count") == "1":
-            return resp.get("recording-list")[0].get("id")
+        recordings = resp.get("recording-list", [])
+        if recordings:
+            return recordings[0].get("id")
         else:
             return None
-
-    def get_playlists_createdfor(self, username):
-        """Returns a list of playlists created by a user."""
-        url = f"{self.ROOT}/user/{username}/playlists/createdfor"
-        return self._make_request(url)
-
-    def get_listenbrainz_playlists(self):
-        """Returns a list of playlists created by ListenBrainz."""
-        resp = self.get_playlists_createdfor(self.username)
-        playlists = resp.get("playlists")
-        listenbrainz_playlists = []
-
-        for playlist in playlists:
-            playlist_info = playlist.get("playlist")
-            if playlist_info.get("creator") == "listenbrainz":
-                title = playlist_info.get("title")
-                playlist_type = (
-                    "Exploration" if "Exploration" in title else "Jams"
-                )
-                if "week of " in title:
-                    date_str = title.split("week of ")[1].split(" ")[0]
-                    date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-                else:
-                    date = None
-                identifier = playlist_info.get("identifier")
-                id = identifier.split("/")[-1]
-                listenbrainz_playlists.append(
-                    {"type": playlist_type, "date": date, "identifier": id}
-                )
-        return listenbrainz_playlists
 
     def get_playlist(self, identifier):
         """Returns a playlist."""
@@ -245,3 +209,4 @@ class ListenBrainzPlugin(BeetsPlugin):
     def get_last_weekly_jams(self):
         """Returns a list of weekly jams."""
         return self.get_weekly_playlist(3)
+
