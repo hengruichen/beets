@@ -114,38 +114,66 @@ class ListenBrainzPlugin(BeetsPlugin):
             if mbid_mapping.get("recording_mbid") is None:
                 # search for the track using title and release
                 mbid = self.get_mb_recording_id(track)
-            tracks.append(
-                {
-                    "album": {
-                        "name": track["track_metadata"].get("release_name")
-                    },
-                    "name": track["track_metadata"].get("track_name"),
-                    "artist": {
-                        "name": track["track_metadata"].get("artist_name")
-                    },
-                    "mbid": mbid,
-                    "release_mbid": mbid_mapping.get("release_mbid"),
-                    "listened_at": track.get("listened_at"),
-                }
-            )
-        return tracks
+            tracks.append({"mbid": mbid})
+        return self.get_track_info(tracks)
 
     def get_mb_recording_id(self, track):
-        """Returns the MusicBrainz recording ID for a track."""
-        resp = musicbrainzngs.search_recordings(
-            query=track["track_metadata"].get("track_name"),
-            release=track["track_metadata"].get("release_name"),
-            strict=True,
-        )
-        if resp.get("recording-count") == "1":
-            return resp.get("recording-list")[0].get("id")
+        """Returns the MusicBrainz ID of a track."""
+        title = track["track_metadata"]["track_name"]
+        release = track["track_metadata"]["release_name"]
+        artist = track["track_metadata"]["artist_name"]
+        params = {
+            "query": f"{title} {release} {artist}",
+            "limit": 1,
+            "offset": 0,
+            "include": "recordings",
+        }
+        resp = musicbrainzngs.search_recordings(**params)
+        recordings = resp.get("recording-list", [])
+        if recordings:
+            return recordings[0].get("id")
         else:
             return None
 
-    def get_playlists_createdfor(self, username):
-        """Returns a list of playlists created by a user."""
-        url = f"{self.ROOT}/user/{username}/playlists/createdfor"
-        return self._make_request(url)
+    def get_track_info(self, tracks):
+        """Returns a list of track info."""
+        track_info = []
+        for track in tracks:
+            identifier = track.get("mbid")
+            resp = musicbrainzngs.get_recording_by_id(
+                identifier, includes=["releases", "artist-credits"]
+            )
+            recording = resp.get("recording")
+            title = recording.get("title")
+            artist_credit = recording.get("artist-credit", [])
+            if artist_credit:
+                artist = artist_credit[0].get("artist", {}).get("name")
+            else:
+                artist = None
+            releases = recording.get("release-list", [])
+            if releases:
+                album = releases[0].get("title")
+                date = releases[0].get("date")
+                year = date.split("-")[0] if date else None
+            else:
+                album = None
+                year = None
+            track_info.append(
+                {
+                    "identifier": identifier,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "year": year,
+                }
+            )
+        return track_info
+
+    def get_weekly_playlist(self, index):
+        """Returns a list of weekly playlists based on the index."""
+        playlists = self.get_listenbrainz_playlists()
+        playlist = self.get_playlist(playlists[index].get("identifier"))
+        return self.get_tracks_from_playlist(playlist)
 
     def get_listenbrainz_playlists(self):
         """Returns a list of playlists created by ListenBrainz."""
@@ -190,54 +218,6 @@ class ListenBrainzPlugin(BeetsPlugin):
             )
         return self.get_track_info(tracks)
 
-    def get_track_info(self, tracks):
-        """Returns a list of track info."""
-        track_info = []
-        for track in tracks:
-            identifier = track.get("identifier")
-            resp = musicbrainzngs.get_recording_by_id(
-                identifier, includes=["releases", "artist-credits"]
-            )
-            recording = resp.get("recording")
-            title = recording.get("title")
-            artist_credit = recording.get("artist-credit", [])
-            if artist_credit:
-                artist = artist_credit[0].get("artist", {}).get("name")
-            else:
-                artist = None
-            releases = recording.get("release-list", [])
-            if releases:
-                album = releases[0].get("title")
-                date = releases[0].get("date")
-                year = date.split("-")[0] if date else None
-            else:
-                album = None
-                year = None
-            track_info.append(
-                {
-                    "identifier": identifier,
-                    "title": title,
-                    "artist": artist,
-                    "album": album,
-                    "year": year,
-                }
-            )
-        return track_info
-
-    def get_weekly_playlist(self, index):
-        """Returns a list of weekly playlists based on the index."""
-        playlists = self.get_listenbrainz_playlists()
-        playlist = self.get_playlist(playlists[index].get("identifier"))
-        return self.get_tracks_from_playlist(playlist)
-
-    def get_weekly_exploration(self):
-        """Returns a list of weekly exploration."""
-        return self.get_weekly_playlist(0)
-
-    def get_weekly_jams(self):
-        """Returns a list of weekly jams."""
-        return self.get_weekly_playlist(1)
-
     def get_last_weekly_exploration(self):
         """Returns a list of weekly exploration."""
         return self.get_weekly_playlist(3)
@@ -245,3 +225,4 @@ class ListenBrainzPlugin(BeetsPlugin):
     def get_last_weekly_jams(self):
         """Returns a list of weekly jams."""
         return self.get_weekly_playlist(3)
+
