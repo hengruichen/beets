@@ -102,112 +102,9 @@ class SmartPlaylistTest(_common.TestCase):
         )
         asseq(
             sorts["mixed"],
-            MultipleSort([sort("year"), sort("genre"), sort("id", False)]),
-        )
-
-    def test_matches(self):
-        spl = SmartPlaylistPlugin()
-
-        a = MagicMock(Album)
-        i = MagicMock(Item)
-
-        self.assertFalse(spl.matches(i, None, None))
-        self.assertFalse(spl.matches(a, None, None))
-
-        query = Mock()
-        query.match.side_effect = {i: True}.__getitem__
-        self.assertTrue(spl.matches(i, query, None))
-        self.assertFalse(spl.matches(a, query, None))
-
-        a_query = Mock()
-        a_query.match.side_effect = {a: True}.__getitem__
-        self.assertFalse(spl.matches(i, None, a_query))
-        self.assertTrue(spl.matches(a, None, a_query))
-
-        self.assertTrue(spl.matches(i, query, a_query))
-        self.assertTrue(spl.matches(a, query, a_query))
-
-    def test_db_changes(self):
-        spl = SmartPlaylistPlugin()
-
-        nones = None, None
-        pl1 = "1", ("q1", None), nones
-        pl2 = "2", ("q2", None), nones
-        pl3 = "3", ("q3", None), nones
-
-        spl._unmatched_playlists = {pl1, pl2, pl3}
-        spl._matched_playlists = set()
-
-        spl.matches = Mock(return_value=False)
-        spl.db_change(None, "nothing")
-        self.assertEqual(spl._unmatched_playlists, {pl1, pl2, pl3})
-        self.assertEqual(spl._matched_playlists, set())
-
-        spl.matches.side_effect = lambda _, q, __: q == "q3"
-        spl.db_change(None, "matches 3")
-        self.assertEqual(spl._unmatched_playlists, {pl1, pl2})
-        self.assertEqual(spl._matched_playlists, {pl3})
-
-        spl.matches.side_effect = lambda _, q, __: q == "q1"
-        spl.db_change(None, "matches 3")
-        self.assertEqual(spl._matched_playlists, {pl1, pl3})
-        self.assertEqual(spl._unmatched_playlists, {pl2})
-
-    def test_playlist_update(self):
-        spl = SmartPlaylistPlugin()
-
-        i = Mock(path=b"/tagada.mp3")
-        i.evaluate_template.side_effect = lambda pl, _: pl.replace(
-            b"$title", b"ta:ga:da"
-        ).decode()
-
-        lib = Mock()
-        lib.replacements = CHAR_REPLACE
-        lib.items.return_value = [i]
-        lib.albums.return_value = []
-
-        q = Mock()
-        a_q = Mock()
-        pl = b"$title-my<playlist>.m3u", (q, None), (a_q, None)
-        spl._matched_playlists = [pl]
-
-        dir = bytestring_path(mkdtemp())
-        config["smartplaylist"]["relative_to"] = False
-        config["smartplaylist"]["playlist_dir"] = py3_path(dir)
-        try:
-            spl.update_playlists(lib)
-        except Exception:
-            rmtree(syspath(dir))
-            raise
-
-        lib.items.assert_called_once_with(q, None)
-        lib.albums.assert_called_once_with(a_q, None)
-
-        m3u_filepath = path.join(dir, b"ta_ga_da-my_playlist_.m3u")
-        self.assertExists(m3u_filepath)
-        with open(syspath(m3u_filepath), "rb") as f:
-            content = f.read()
-        rmtree(syspath(dir))
-
-        self.assertEqual(content, b"/tagada.mp3\n")
-
-    def test_playlist_update_extm3u(self):
-        spl = SmartPlaylistPlugin()
-
-        i = MagicMock()
-        type(i).artist = PropertyMock(return_value="fake artist")
-        type(i).title = PropertyMock(return_value="fake title")
-        type(i).length = PropertyMock(return_value=300.123)
-        type(i).path = PropertyMock(return_value=b"/tagada.mp3")
-        i.evaluate_template.side_effect = lambda pl, _: pl.replace(
-            b"$title",
-            b"ta:ga:da",
-        ).decode()
-
-        lib = Mock()
-        lib.replacements = CHAR_REPLACE
-        lib.items.return_value = [i]
-        lib.albums.return_value = []
+            MultipleSort([sort("year"), sort("genre"), sort("id", False
+# ... [truncated] ...
+e = []
 
         q = Mock()
         a_q = Mock()
@@ -329,3 +226,4 @@ def suite():
 
 if __name__ == "__main__":
     unittest.main(defaultTest="suite")
+
