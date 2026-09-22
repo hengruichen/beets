@@ -37,7 +37,7 @@ class ListenBrainzPlugin(BeetsPlugin):
         return [lbupdate_cmd]
 
     def _lbupdate(self, lib, log):
-        """Obtain view count from Listenbrainz."""
+        """Obtain view count from ListenBrainz."""
         found_total = 0
         unknown_total = 0
         ls = self.get_listens()
@@ -116,31 +116,160 @@ class ListenBrainzPlugin(BeetsPlugin):
                 mbid = self.get_mb_recording_id(track)
             tracks.append(
                 {
-                    "album": {
-                        "name": track["track_metadata"].get("release_name")
-                    },
-                    "name": track["track_metadata"].get("track_name"),
-                    "artist": {
-                        "name": track["track_metadata"].get("artist_name")
-                    },
-                    "mbid": mbid,
-                    "release_mbid": mbid_mapping.get("release_mbid"),
-                    "listened_at": track.get("listened_at"),
+                    "artist": mbid_mapping.get("artist_mbid"),
+                    "identifier": mbid,
+                    "title": track["track_metadata"].get("title"),
                 }
             )
-        return tracks
+        return self.get_track_info(tracks)
 
     def get_mb_recording_id(self, track):
-        """Returns the MusicBrainz recording ID for a track."""
-        resp = musicbrainzngs.search_recordings(
-            query=track["track_metadata"].get("track_name"),
-            release=track["track_metadata"].get("release_name"),
-            strict=True,
-        )
-        if resp.get("recording-count") == "1":
-            return resp.get("recording-list")[0].get("id")
+        """Returns the MusicBrainz ID of the recording."""
+        title = track["track_metadata"].get("title")
+        release = track["track_metadata"].get("release_name")
+        params = {
+            "query": f"title:{title} AND release:{release}",
+            "limit": 1,
+        }
+        resp = musicbrainzngs.search_recordings(params=params)
+        recordings = resp.get("recording-list", [])
+        if recordings:
+            return recordings[0].get("id")
         else:
             return None
+
+    def get_track_info(self, tracks):
+        """Returns a list of track info."""
+        track_info = []
+        for track in tracks:
+            identifier = track.get("identifier")
+            resp = musicbrainzngs.get_recording_by_id(
+                identifier, includes=["releases", "artist-credits"]
+            )
+            recording = resp.get("recording")
+            title = recording.get("title")
+            artist_credit = recording.get("artist-credit", [])
+            if artist_credit:
+                artist = artist_credit[0].get("artist", {}).get("name")
+            else:
+                artist = None
+            releases = recording.get("release-list", [])
+            if releases:
+                album = releases[0].get("title")
+                date = releases[0].get("date")
+                year = date.split("-")[0] if date else None
+            else:
+                album = None
+                year = None
+            track_info.append(
+                {
+                    "identifier": identifier,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "year": year,
+                }
+            )
+        return track_info
+
+    def get_playlist(self, identifier):
+        """Returns a playlist."""
+        url = f"{self.ROOT}/playlist/{identifier}"
+        return self._make_request(url)
+
+    def get_tracks_from_playlist(self, playlist):
+        """This function returns a list of tracks in the playlist."""
+        tracks = []
+        for track in playlist.get("playlist").get("track"):
+            tracks.append(
+                {
+                    "artist": track.get("creator"),
+                    "identifier": track.get("identifier").split("/")[-1],
+                    "title": track.get("title"),
+                }
+            )
+        return self.get_track_info(tracks)
+
+    def get_track_info(self, tracks):
+        """Returns a list of track info."""
+        track_info = []
+        for track in tracks:
+            identifier = track.get("identifier")
+            resp = musicbrainzngs.get_recording_by_id(
+                identifier, includes=["releases", "artist-credits"]
+            )
+            recording = resp.get("recording")
+            title = recording.get("title")
+            artist_credit = recording.get("artist-credit", [])
+            if artist_credit:
+                artist = artist_credit[0].get("artist", {}).get("name")
+            else:
+                artist = None
+            releases = recording.get("release-list", [])
+            if releases:
+                album = releases[0].get("title")
+                date = releases[0].get("date")
+                year = date.split("-")[0] if date else None
+            else:
+                album = None
+                year = None
+            track_info.append(
+                {
+                    "identifier": identifier,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "year": year,
+                }
+            )
+        return track_info
+
+    def get_weekly_playlist(self, index):
+        """Returns a list of weekly playlists based on the index."""
+        playlists = self.get_listenbrainz_playlists()
+        playlist = self.get_playlist(playlists[index].get("identifier"))
+        return self.get_tracks_from_playlist(playlist)
+
+    def get_weekly_exploration(self):
+        """Returns a list of weekly exploration."""
+        return self.get_weekly_playlist(0)
+
+    def get_weekly_jams(self):
+        """Returns a list of weekly jams."""
+        return self.get_weekly_playlist(1)
+
+    def get_last_weekly_exploration(self):
+        """Returns a list of weekly exploration."""
+        return self.get_weekly_playlist(3)
+
+    def get_last_weekly_jams(self):
+        """Returns a list of weekly jams."""
+        return self.get_weekly_playlist(3)
+
+    def get_listenbrainz_playlists(self):
+        """Returns a list of playlists created by ListenBrainz."""
+        resp = self.get_playlists_createdfor(self.username)
+        playlists = resp.get("playlists")
+        listenbrainz_playlists = []
+
+        for playlist in playlists:
+            playlist_info = playlist.get("playlist")
+            if playlist_info.get("creator") == "listenbrainz":
+                title = playlist_info.get("title")
+                playlist_type = (
+                    "Exploration" if "Exploration" in title else "Jams"
+                )
+                if "week of " in title:
+                    date_str = title.split("week of ")[1].split(" ")[0]
+                    date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                else:
+                    date = None
+                identifier = playlist_info.get("identifier")
+                id = identifier.split("/")[-1]
+                listenbrainz_playlists.append(
+                    {"type": playlist_type, "date": date, "identifier": id}
+                )
+        return listenbrainz_playlists
 
     def get_playlists_createdfor(self, username):
         """Returns a list of playlists created by a user."""
@@ -245,3 +374,4 @@ class ListenBrainzPlugin(BeetsPlugin):
     def get_last_weekly_jams(self):
         """Returns a list of weekly jams."""
         return self.get_weekly_playlist(3)
+
