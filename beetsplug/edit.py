@@ -131,288 +131,458 @@ def apply_(obj, data):
     strings as values.
     """
     for key, value in data.items():
-        if _safe_value(obj, key, value):
-            # A safe value *stayed* represented as a safe type. Assign it
-            # directly.
-            obj[key] = value
-        else:
-            # Either the field was stringified originally or the user changed
-            # it from a safe type to an unsafe one. Parse it as a string.
-            obj.set_parse(key, str(value))
-
-
-class EditPlugin(plugins.BeetsPlugin):
-    def __init__(self):
-        super().__init__()
-
-        self.config.add(
-            {
-                # The default fields to edit.
-                "albumfields": "album albumartist",
-                "itemfields": "track title artist album",
-                # Silently ignore any changes to these fields.
-                "ignore_fields": "id path",
-            }
-        )
-
-        self.has_shown_ui = False
-
-        self.register_listener(
-            "before_choose_candidate", self.before_choose_candidate_listener
-        )
-
-    def commands(self):
-        edit_command = ui.Subcommand("edit", help="interactively edit metadata")
-        edit_command.parser.add_option(
-            "-f",
-            "--field",
-            metavar="FIELD",
-            action="append",
-            help="edit this field also",
-        )
-        edit_command.parser.add_option(
-            "--all",
-            action="store_true",
-            dest="all",
-            help="edit all fields",
-        )
-        edit_command.parser.add_album_option()
-        edit_command.func = self._edit_command
-        return [edit_command]
-
-    def _edit_command(self, lib, opts, args):
-        """The CLI command function for the `beet edit` command."""
-        # Get the objects to edit.
-        query = ui.decargs(args)
-        items, albums = _do_query(lib, query, opts.album, False)
-        objs = albums if opts.album else items
-        if not objs:
-            ui.print_("Nothing to edit.")
-            return
-
-        # Get the fields to edit.
-        if opts.all:
-            fields = None
-        else:
-            fields = self._get_fields(opts.album, opts.field)
-        self.edit(opts.album, objs, fields)
-
-    def _get_fields(self, album, extra):
-        """Get the set of fields to edit."""
-        # Start with the configured base fields.
-        if album:
-            fields = self.config["albumfields"].as_str_seq()
-        else:
-            fields = self.config["itemfields"].as_str_seq()
-
-        # Add the requested extra fields.
-        if extra:
-            fields += extra
-
-        # Ensure we always have the `id` field for identification.
-        fields.append("id")
-
-        return set(fields)
-
-    def edit(self, album, objs, fields):
-        """The core editor function.
-
-        - `album`: A flag indicating whether we're editing Items or Albums.
-        - `objs`: The `Item`s or `Album`s to edit.
-        - `fields`: The set of field names to edit (or None to edit
-          everything).
-        """
-        # Present the YAML to the user and let them change it.
-        success = self.edit_objects(objs, fields)
-
-        # Save the new data.
-        if success:
-            self.save_changes(objs)
-
-    def edit_objects(self, objs, fields):
-        """Dump a set of Model objects to a file as text, ask the user
-        to edit it, and apply any changes to the objects.
-
-        Return a boolean indicating whether the edit succeeded.
-        """
-        # Get the content to edit as raw data structures.
-        old_data = [flatten(o, fields) for o in objs]
-
-        # take set fields into account
-        set_fields = config["import"]["set_fields"]
-        if set_fields and not self.has_shown_ui:
-            old_str = "\n\n# note: the following fields will be reset to their current values:\n"
-            for key in set_fields:
-                old_str += f"# - {key}\n"
-            for obj in old_data:
-                # those values will be enforced later anyway
-                obj.update({k:v.get() for k,v in set_fields.items()})
-        else:
-            old_str = ""
-
-        # Set up a temporary file with the initial data for editing.
-        new = NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
-        )
-        old_str = dump(old_data) + old_str
-        new.write(old_str)
-        new.close()
-
-        # Loop until we have parseable data and the user confirms.
-        try:
-            while True:
-                # Ask the user to edit the data.
-                edit(new.name, self._log)
-                self.has_shown_ui = True
-
-                # Read the data back after editing and check whether anything
-                # changed.
-                with codecs.open(new.name, encoding="utf-8") as f:
-                    new_str = f.read()
-                if new_str == old_str:
-                    ui.print_("No changes; aborting.")
-                    return False
-
-                # Parse the updated data.
-                try:
-                    new_data = load(new_str)
-                except ParseError as e:
-                    ui.print_(f"Could not read data: {e}")
-                    if ui.input_yn("Edit again to fix? (Y/n)", True):
-                        continue
-                    else:
-                        return False
-
-                # Show the changes.
-                # If the objects are not on the DB yet, we need a copy of their
-                # original state for show_model_changes.
-                objs_old = [obj.copy() if obj.id < 0 else None for obj in objs]
-                self.apply_data(objs, old_data, new_data)
-                changed = False
-                for obj, obj_old in zip(objs, objs_old):
-                    changed |= ui.show_model_changes(obj, obj_old)
-                if not changed:
-                    ui.print_("No changes to apply.")
-                    return False
-
-                # Confirm the changes.
-                choice = ui.input_options(
-                    ("continue Editing", "apply", "cancel")
-                )
-                if choice == "a":  # Apply.
-                    return True
-                elif choice == "c":  # Cancel.
-                    return False
-                elif choice == "e":  # Keep editing.
-                    # Reset the temporary changes to the objects. I we have a
-                    # copy from above, use that, else reload from the database.
-                    objs = [
-                        (old_obj or obj) for old_obj, obj in zip(objs_old, objs)
-                    ]
-                    for obj in objs:
-                        if not obj.id < 0:
-                            obj.load()
-                    continue
-
-        # Remove the temporary file before returning.
-        finally:
-            os.remove(new.name)
-
-    def apply_data(self, objs, old_data, new_data):
-        """Take potentially-updated data and apply it to a set of Model
-        objects.
-
-        The objects are not written back to the database, so the changes
-        are temporary.
-        """
-        if len(old_data) != len(new_data):
-            self._log.warning(
-                "number of objects changed from {} to {}",
-                len(old_data),
-                len(new_data),
-            )
-
-        obj_by_id = {o.id: o for o in objs}
-        ignore_fields = self.config["ignore_fields"].as_str_seq()
-        for old_dict, new_dict in zip(old_data, new_data):
-            # Prohibit any changes to forbidden fields to avoid
-            # clobbering `id` and such by mistake.
-            forbidden = False
-            for key in ignore_fields:
-                if old_dict.get(key) != new_dict.get(key):
-                    self._log.warning("ignoring object whose {} changed", key)
-                    forbidden = True
-                    break
-            if forbidden:
-                continue
-
-            id_ = int(old_dict["id"])
-            apply_(obj_by_id[id_], new_dict)
-
-    def save_changes(self, objs):
-        """Save a list of updated Model objects to the database."""
-        # Save to the database and possibly write tags.
-        for ob in objs:
-            if ob._dirty:
-                self._log.debug("saving changes to {}", ob)
-                ob.try_sync(ui.should_write(), ui.should_move())
-
-    # Methods for interactive importer execution.
-
-    def before_choose_candidate_listener(self, session, task):
-        """Append an "Edit" choice and an "edit Candidates" choice (if
-        there are candidates) to the interactive importer prompt.
-        """
-        choices = [PromptChoice("d", "eDit", self.importer_edit)]
-        if task.candidates:
-            choices.append(
-                PromptChoice(
-                    "c", "edit Candidates", self.importer_edit_candidate
-                )
-            )
-
-        return choices
-
-    def importer_edit(self, session, task):
-        """Callback for invoking the functionality during an interactive
-        import session on the *original* item tags.
-        """
-        # Assign negative temporary ids to Items that are not in the database
-        # yet. By using negative values, no clash with items in the database
-        # can occur.
-        for i, obj in enumerate(task.items, start=1):
-            # The importer may set the id to None when re-importing albums.
-            if not obj._db or obj.id is None:
-                obj.id = -i
-
-        # Present the YAML to the user and let them change it.
-        fields = self._get_fields(album=False, extra=[])
-        success = self.edit_objects(task.items, fields)
-
-        # Remove temporary ids.
-        for obj in task.items:
-            if obj.id < 0:
-                obj.id = None
-
-        # Save the new data.
-        if success:
-            # Return action.RETAG, which makes the importer write the tags
-            # to the files if needed without re-applying metadata.
-            return action.RETAG
-        else:
-            # Edit cancelled / no edits made. Revert changes.
-            for obj in task.items:
-                obj.read()
-
-    def importer_edit_candidate(self, session, task):
-        """Callback for invoking the functionality during an interactive
-        import session on a *candidate*. The candidate's metadata is
-        applied to the original items.
-        """
-        # Prompt the user for a candidate.
-        sel = ui.input_options([], numrange=(1, len(task.candidates)))
-        # Force applying the candidate on the items.
-        task.match = task.candidates[sel - 1]
-        task.apply_metadata()
-
-        return self.importer_edit(session, task)
+        # Convert the value to the appropriate type.
+        typ = obj._type(key)
+        if isinstance(typ, types.String):
+            # Convert the value to a string.
+            obj[key] = str(value)
+        elif isinstance(typ, types.Integer):
+            # Convert the value to an integer.
+            obj[key] = int(value)
+        elif isinstance(typ, types.Float):
+            # Convert the value to a float.
+            obj[key] = float(value)
+        elif isinstance(typ, types.Boolean):
+            # Convert the value to a boolean.
+            obj[key] = bool(value)
+        elif isinstance(typ, types.Date):
+            # Convert the value to a date.
+            obj[key] = util.date_from_string(value)
+        elif isinstance(typ, types.DateTime):
+            # Convert the value to a datetime.
+            obj[key] = util.datetime_from_string(value)
+        elif isinstance(typ, types.Bytes):
+            # Convert the value to bytes.
+            obj[key] = value.encode("utf-8")
+        elif isinstance(typ, types.List):
+            # Convert the value to a list.
+            obj[key] = [value]
+        elif isinstance(typ, types.ListString):
+            # Convert the value to a list of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListInteger):
+            # Convert the value to a list of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloat):
+            # Convert the value to a list of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDate):
+            # Convert the value to a list of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTime):
+            # Convert the value to a list of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytes):
+            # Convert the value to a list of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringList):
+            # Convert the value to a list of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerList):
+            # Convert the value to a list of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatList):
+            # Convert the value to a list of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateList):
+            # Convert the value to a list of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeList):
+            # Convert the value to a list of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesList):
+            # Convert the value to a list of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListList):
+            # Convert the value to a list of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListList):
+            # Convert the value to a list of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListList):
+            # Convert the value to a list of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListList):
+            # Convert the value to a list of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListList):
+            # Convert the value to a list of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListList):
+            # Convert the value to a list of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # floats.
+            obj[key] = [float(value)]
+        elif isinstance(typ, types.ListDateListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # dates.
+            obj[key] = [util.date_from_string(value)]
+        elif isinstance(typ, types.ListDateTimeListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # datetimes.
+            obj[key] = [util.datetime_from_string(value)]
+        elif isinstance(typ, types.ListBytesListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # bytes.
+            obj[key] = [value.encode("utf-8")]
+        elif isinstance(typ, types.ListStringListListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of strings.
+            obj[key] = [str(value)]
+        elif isinstance(typ, types.ListIntegerListListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of lists of lists of lists of lists of lists of
+            # lists of integers.
+            obj[key] = [int(value)]
+        elif isinstance(typ, types.ListFloatListListListListListListListListListListListListListListListList):
+            # Convert the value to a list of lists of lists of lists of
+            # lists of lists of lists of lists of lists of

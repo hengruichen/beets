@@ -189,3 +189,4 @@ class AdvancedRewritePlugin(BeetsPlugin):
             self.template_fields[fieldname] = getter
             if fieldname in Album._fields:
                 self.album_template_fields[fieldname] = getter
+
